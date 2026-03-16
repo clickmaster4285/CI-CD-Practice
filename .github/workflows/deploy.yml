@@ -84,10 +84,10 @@ jobs:
         with:
           name: next-build
           path: frontend/.next
-          retention-days: 1  # Only keep for 1 day
+          retention-days: 1
 
   # ====================================================
-  # 3️⃣ Manual Approval Before Production (FIXED)
+  # 3️⃣ Manual Approval Before Production
   # ====================================================
   approval:
     name: Manual Approval Required
@@ -121,7 +121,7 @@ jobs:
           echo "=========================================="
 
   # ====================================================
-  # 4️⃣ Deploy to VPS (Only runs after approval)
+  # 4️⃣ Deploy to VPS (With Rollback Functionality)
   # ====================================================
   deploy:
     name: Deploy to Production
@@ -140,7 +140,7 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
-      - name: Deploy Application
+      - name: Deploy Application with Rollback
         run: |
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
             set -e
@@ -174,26 +174,72 @@ jobs:
             
             cd "$APP_DIR"
             
-            # Save current commit for rollback
+            # Create backup directory if it doesn't exist
+            BACKUP_DIR="$APP_DIR/../backups"
+            mkdir -p "$BACKUP_DIR"
+            
+            # Save current commit and create backup before pulling
             PREVIOUS_COMMIT=$(git rev-parse HEAD)
-            echo "📦 Previous commit: $(echo $PREVIOUS_COMMIT | cut -c1-7)"
+            PREVIOUS_COMMIT_SHORT=$(echo $PREVIOUS_COMMIT | cut -c1-7)
+            echo "📦 Current commit: $PREVIOUS_COMMIT_SHORT"
+            
+            # Create timestamp for backup
+            TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+            BACKUP_PATH="$BACKUP_DIR/backup_${PREVIOUS_COMMIT_SHORT}_${TIMESTAMP}"
+            
+            # Backup current node_modules and .next for quick rollback
+            echo "💾 Creating backup of current build..."
+            if [ -d "node_modules" ] && [ -d ".next" ]; then
+              mkdir -p "$BACKUP_PATH"
+              cp -r node_modules .next package.json package-lock.json "$BACKUP_PATH/" 2>/dev/null || true
+              echo "✅ Backup created at: $BACKUP_PATH"
+            fi
+            
+            # Store current PM2 logs
+            echo "📝 Saving PM2 logs..."
+            pm2 logs "${{ env.APP_NAME }}" --lines 100 --nostream > "$BACKUP_PATH/pm2_logs.txt" 2>/dev/null || true
             
             # Pull latest code
             echo "📥 Fetching latest code..."
             git fetch origin
-            git reset --hard origin/master
             
-            NEW_COMMIT=$(git rev-parse HEAD)
-            echo "📦 New commit: $(echo $NEW_COMMIT | cut -c1-7)"
+            # Store new commit hash
+            NEW_COMMIT=$(git rev-parse origin/master)
+            NEW_COMMIT_SHORT=$(echo $NEW_COMMIT | cut -c1-7)
+            echo "📦 New commit: $NEW_COMMIT_SHORT"
+            
+            # Try to pull new code
+            echo "🔄 Pulling new code..."
+            if ! git pull origin master; then
+              echo "❌ Failed to pull code"
+              exit 1
+            fi
             
             # Install dependencies
             echo "📦 Installing dependencies..."
-            rm -rf node_modules
-            npm ci
+            if ! npm ci; then
+              echo "❌ Failed to install dependencies"
+              echo "🔄 Rolling back to previous version..."
+              git reset --hard "$PREVIOUS_COMMIT"
+              exit 1
+            fi
             
             # Build application
             echo "🏗️ Building application..."
-            npm run build
+            if ! npm run build; then
+              echo "❌ Build failed"
+              echo "🔄 Rolling back to previous version..."
+              git reset --hard "$PREVIOUS_COMMIT"
+              
+              # Restore node_modules from backup if build fails
+              if [ -d "$BACKUP_PATH/node_modules" ]; then
+                echo "📦 Restoring node_modules from backup..."
+                rm -rf node_modules
+                cp -r "$BACKUP_PATH/node_modules" ./
+              fi
+              
+              exit 1
+            fi
             
             # Setup PM2 if not exists
             if ! command -v pm2 &> /dev/null; then
@@ -214,25 +260,62 @@ jobs:
             echo "⏳ Waiting for application to start..."
             sleep 15
             
-            # Local health check
-            echo "🏥 Performing local health check..."
-            LOCAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              --connect-timeout 5 \
-              --max-time 10 \
-              http://localhost:${{ env.APP_PORT }} || echo "failed")
+            # Health check with retry
+            echo "🏥 Performing health check..."
+            HEALTHY=false
+            for i in {1..5}; do
+              LOCAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                --connect-timeout 5 \
+                --max-time 10 \
+                http://localhost:${{ env.APP_PORT }} || echo "failed")
+              
+              if [ "$LOCAL_STATUS" = "200" ] || [ "$LOCAL_STATUS" = "301" ] || [ "$LOCAL_STATUS" = "302" ]; then
+                HEALTHY=true
+                echo "✅ Health check passed (HTTP $LOCAL_STATUS)"
+                break
+              else
+                echo "⏳ Health check attempt $i/5: $LOCAL_STATUS"
+                sleep 5
+              fi
+            done
             
-            if [ "$LOCAL_STATUS" = "200" ]; then
-              echo "✅ Local health check passed (HTTP 200)"
-            else
-              echo "⚠️ Local health check returned: $LOCAL_STATUS"
-              echo "⚠️ This may be normal if the app needs more time"
+            # Rollback if health check fails
+            if [ "$HEALTHY" = false ]; then
+              echo "❌ Health check failed after deployment"
+              echo "🔄 Rolling back to previous version..."
+              
+              # Revert code
+              git reset --hard "$PREVIOUS_COMMIT"
+              
+              # Restore from backup
+              if [ -d "$BACKUP_PATH" ]; then
+                echo "📦 Restoring from backup..."
+                rm -rf node_modules .next
+                cp -r "$BACKUP_PATH/node_modules" "$BACKUP_PATH/.next" ./ 2>/dev/null || true
+                cp "$BACKUP_PATH/package.json" "$BACKUP_PATH/package-lock.json" ./ 2>/dev/null || true
+              fi
+              
+              # Restart with old version
+              pm2 restart "${{ env.APP_NAME }}"
+              sleep 10
+              
+              echo "❌ Deployment failed - rolled back to commit $PREVIOUS_COMMIT_SHORT"
+              exit 1
             fi
             
+            # Clean up old backups (keep last 5)
+            echo "🧹 Cleaning up old backups..."
+            cd "$BACKUP_DIR"
+            ls -t | tail -n +6 | xargs -r rm -rf
+            cd "$APP_DIR"
+            
             echo "=========================================="
-            echo "✅ DEPLOYMENT COMPLETED"
+            echo "✅ DEPLOYMENT COMPLETED SUCCESSFULLY"
             echo "=========================================="
             echo "🌐 Website: ${{ env.WEBSITE_URL }}"
             echo "📱 App: ${{ env.APP_NAME }}"
+            echo "📦 New commit: $NEW_COMMIT_SHORT"
+            echo "🔄 Previous commit: $PREVIOUS_COMMIT_SHORT"
           EOF
 
   # ====================================================
@@ -253,6 +336,7 @@ jobs:
           
           MAX_ATTEMPTS=12
           ATTEMPT=1
+          SUCCESS=false
           
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
@@ -264,9 +348,10 @@ jobs:
               "${{ env.WEBSITE_URL }}" || echo "000")
             
             case $HTTP_CODE in
-              200)
-                echo "✅ Website is accessible! (HTTP 200)"
-                exit 0
+              200|301|302)
+                echo "✅ Website is accessible! (HTTP $HTTP_CODE)"
+                SUCCESS=true
+                break
                 ;;
               000)
                 echo "⏳ Connection timeout - retrying..."
@@ -274,7 +359,8 @@ jobs:
               *)
                 if [ $HTTP_CODE -ge 200 ] && [ $HTTP_CODE -lt 500 ]; then
                   echo "✅ Website responded with HTTP $HTTP_CODE"
-                  exit 0
+                  SUCCESS=true
+                  break
                 else
                   echo "⚠️ Got HTTP $HTTP_CODE - retrying..."
                 fi
@@ -285,17 +371,68 @@ jobs:
             [ $ATTEMPT -le $MAX_ATTEMPTS ] && sleep 10
           done
           
-          echo "⚠️ Could not verify website, but deployment completed"
-          echo "📝 Please check manually: ${{ env.WEBSITE_URL }}"
-          exit 0  # Don't fail the pipeline
+          if [ "$SUCCESS" = false ]; then
+            echo "❌ Website verification failed"
+            exit 1
+          fi
 
   # ====================================================
-  # 6️⃣ Deployment Summary
+  # 6️⃣ Rollback Job (if verification fails)
+  # ====================================================
+  rollback:
+    name: Automatic Rollback
+    runs-on: ubuntu-latest
+    needs: [deploy, verify]
+    if: failure()
+    
+    steps:
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+      
+      - name: Perform Emergency Rollback
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            echo "=========================================="
+            echo "🚨 EMERGENCY ROLLBACK INITIATED"
+            echo "=========================================="
+            
+            APP_DIR="${{ secrets.APP_DIR }}"
+            BACKUP_DIR="$APP_DIR/../backups"
+            
+            cd "$APP_DIR"
+            
+            # Get the latest backup
+            LATEST_BACKUP=$(ls -t "$BACKUP_DIR" | head -1)
+            
+            if [ ! -z "$LATEST_BACKUP" ] && [ -d "$BACKUP_DIR/$LATEST_BACKUP" ]; then
+              echo "📦 Found backup: $LATEST_BACKUP"
+              
+              # Restore from backup
+              rm -rf node_modules .next
+              cp -r "$BACKUP_DIR/$LATEST_BACKUP/node_modules" \
+                    "$BACKUP_DIR/$LATEST_BACKUP/.next" \
+                    "$BACKUP_DIR/$LATEST_BACKUP/package.json" \
+                    "$BACKUP_DIR/$LATEST_BACKUP/package-lock.json" ./ 2>/dev/null || true
+              
+              # Restart application
+              pm2 restart "${{ env.APP_NAME }}"
+              
+              echo "✅ Rollback completed successfully"
+            else
+              echo "❌ No backup found for rollback"
+              exit 1
+            fi
+          EOF
+
+  # ====================================================
+  # 7️⃣ Deployment Summary
   # ====================================================
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [quality, build, approval, deploy, verify]
+    needs: [quality, build, approval, deploy, verify, rollback]
     if: always()
     
     steps:
@@ -312,6 +449,7 @@ jobs:
           echo "👤 Approval: ${{ needs.approval.result }}"
           echo "🚀 Deploy: ${{ needs.deploy.result }}"
           echo "🔍 Verify: ${{ needs.verify.result }}"
+          echo "🔄 Rollback: ${{ needs.rollback.result }}"
           echo ""
           echo "Deployment Details:"
           echo "------------------"
@@ -319,9 +457,13 @@ jobs:
           echo "📱 App Name: ${{ env.APP_NAME }}"
           echo "🔌 Port: ${{ env.APP_PORT }}"
           echo ""
-          if [ "${{ needs.deploy.result }}" = "success" ]; then
-            echo "✅ Production deployment completed successfully!"
+          
+          if [ "${{ needs.deploy.result }}" = "success" ] && [ "${{ needs.verify.result }}" = "success" ]; then
+            echo "✅✅ Production deployment completed successfully!"
+          elif [ "${{ needs.rollback.result }}" = "success" ]; then
+            echo "⚠️ Deployment failed - Automatically rolled back to previous version"
           else
-            echo "⚠️ Deployment completed with warnings"
+            echo "❌ Deployment failed - Manual intervention required"
           fi
+          
           echo "=========================================="
