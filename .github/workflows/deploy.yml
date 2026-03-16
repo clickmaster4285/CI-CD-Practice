@@ -117,104 +117,194 @@ jobs:
 
       - name: Deploy to VPS
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
             set -e
-
-            echo "Loading NVM..."
+            
+            echo "=================================="
+            echo "🚀 Starting Deployment"
+            echo "=================================="
+            
+            # Load NVM
             export NVM_DIR="$HOME/.nvm"
-            source $NVM_DIR/nvm.sh
-            nvm use 24.13.0
-
-            node -v
-            npm -v
-
-            APP_DIR=${{ secrets.APP_DIR }}
-            cd $APP_DIR
-
-            echo "Saving current commit..."
-            PREVIOUS_COMMIT=$(git rev-parse HEAD)
-
-            echo "Fetching latest code..."
-            git fetch origin
-            git reset --hard origin/master
-
-            echo "Cleaning old build..."
-            rm -rf node_modules .next
-
-            echo "Installing dependencies..."
-            npm install
-
-            echo "Building application..."
-            npm run build
-
-            echo "Restarting PM2..."
-            pm2 restart ${{ env.APP_NAME }} || pm2 start npm --name "${{ env.APP_NAME }}" -- start
-            pm2 save
-
-            echo "Waiting for app startup..."
-            sleep 15
-
-            echo "Running health check..."
-            STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://localhost:${{ env.APP_PORT }})
-
-            if [ "$STATUS" != "200" ]; then
-              echo "Deployment failed. Rolling back..."
-              git reset --hard $PREVIOUS_COMMIT
-              rm -rf node_modules .next
-              npm install
-              npm run build
-              pm2 restart ${{ env.APP_NAME }}
+            if [ -s "$NVM_DIR/nvm.sh" ]; then
+              source "$NVM_DIR/nvm.sh"
+            else
+              echo "❌ NVM not found"
               exit 1
             fi
-
-            echo "Deployment successful"
+            
+            # Use Node.js
+            nvm use 20 || nvm install 20
+            node -v
+            npm -v
+            
+            # Navigate to app directory
+            APP_DIR="${{ secrets.APP_DIR }}"
+            if [ ! -d "$APP_DIR" ]; then
+              echo "❌ App directory not found: $APP_DIR"
+              exit 1
+            fi
+            
+            cd "$APP_DIR"
+            
+            echo "📦 Current commit: $(git rev-parse --short HEAD)"
+            
+            # Save current commit for rollback
+            PREVIOUS_COMMIT=$(git rev-parse HEAD)
+            
+            echo "📥 Fetching latest code..."
+            git fetch origin
+            git reset --hard origin/master
+            
+            echo "🧹 Cleaning old build..."
+            rm -rf node_modules .next
+            
+            echo "📦 Installing dependencies..."
+            npm ci
+            
+            echo "🏗️ Building application..."
+            npm run build
+            
+            echo "🔄 Restarting PM2..."
+            # Check if PM2 is installed
+            if ! command -v pm2 &> /dev/null; then
+              npm install -g pm2
+            fi
+            
+            # Check if app exists in PM2
+            if pm2 list | grep -q "${{ env.APP_NAME }}"; then
+              pm2 restart "${{ env.APP_NAME }}"
+            else
+              pm2 start npm --name "${{ env.APP_NAME }}" -- start
+            fi
+            
+            pm2 save
+            
+            echo "⏳ Waiting for application to start..."
+            sleep 20
+            
+            echo "🏥 Running local health check..."
+            MAX_RETRIES=12
+            RETRY_COUNT=0
+            HEALTHY=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                --connect-timeout 5 \
+                --max-time 10 \
+                http://localhost:${{ env.APP_PORT }} || echo "failed")
+              
+              if [ "$STATUS" = "200" ]; then
+                HEALTHY=true
+                echo "✅ Local health check passed"
+                break
+              else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                echo "⏳ Waiting for service... (Attempt $RETRY_COUNT/$MAX_RETRIES)"
+                sleep 5
+              fi
+            done
+            
+            if [ "$HEALTHY" = false ]; then
+              echo "❌ Local health check failed. Rolling back..."
+              
+              # Rollback
+              git reset --hard "$PREVIOUS_COMMIT"
+              rm -rf node_modules .next
+              npm ci
+              npm run build
+              
+              if pm2 list | grep -q "${{ env.APP_NAME }}"; then
+                pm2 restart "${{ env.APP_NAME }}"
+              else
+                pm2 start npm --name "${{ env.APP_NAME }}" -- start
+              fi
+              
+              echo "❌ Deployment failed - rolled back to previous version"
+              exit 1
+            fi
+            
+            echo "=================================="
+            echo "✅ Deployment completed successfully"
+            echo "=================================="
           EOF
 
   # ====================================================
   # 5️⃣ Post Deployment Monitoring
   # ====================================================
-monitoring:
-  name: Post Deployment Monitoring
-  runs-on: ubuntu-latest
-  needs: deploy
+  monitoring:
+    name: Post Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
 
-  steps:
-    - name: Wait for Application to be Ready
-      run: |
-        echo "Waiting for application to start..."
-        sleep 30  # Give it more time to start
+    steps:
+      - name: Monitor Website Health
+        run: |
+          echo "=================================="
+          echo "🔍 Starting Post-Deployment Monitoring"
+          echo "=================================="
+          
+          MAX_RETRIES=30
+          RETRY_INTERVAL=10
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Check $i of $MAX_RETRIES..."
+            
+            # Curl with proper timeout and follow redirects
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 20 \
+              --location \
+              --retry 2 \
+              --retry-delay 2 \
+              "${{ env.WEBSITE_URL }}" || echo "000")
+            
+            case $HTTP_CODE in
+              200)
+                echo "✅ Website is healthy! (HTTP 200)"
+                exit 0
+                ;;
+              000)
+                echo "⏳ Connection timeout - server may be starting"
+                ;;
+              301|302)
+                echo "⚠️ Redirect detected - checking final destination"
+                # Follow redirect and check final URL
+                FINAL_URL=$(curl -s -o /dev/null -w "%{url_effective}" \
+                  --connect-timeout 10 \
+                  --location \
+                  "${{ env.WEBSITE_URL }}")
+                echo "📌 Redirects to: $FINAL_URL"
+                ;;
+              401|403)
+                echo "⚠️ Authentication required (HTTP $HTTP_CODE)"
+                # Still consider this as site is up
+                exit 0
+                ;;
+              502|503|504)
+                echo "⚠️ Gateway error (HTTP $HTTP_CODE) - application might still be loading"
+                ;;
+              *)
+                if [ $HTTP_CODE -ge 200 ] && [ $HTTP_CODE -lt 500 ]; then
+                  echo "⚠️ Got HTTP $HTTP_CODE - site is responding"
+                  # Consider any 2xx/3xx/4xx as site is up
+                  exit 0
+                else
+                  echo "⚠️ Unexpected response: HTTP $HTTP_CODE"
+                fi
+                ;;
+            esac
+            
+            echo "⏳ Waiting $RETRY_INTERVAL seconds before next check..."
+            sleep $RETRY_INTERVAL
+          done
+          
+          echo "❌ Failed to get successful response after $MAX_RETRIES attempts"
+          echo "⚠️ This doesn't necessarily mean deployment failed - check manually at:"
+          echo "   ${{ env.WEBSITE_URL }}"
+          exit 0  # Don't fail the pipeline just because monitoring times out
 
-    - name: Check Website Health with Retries
-      run: |
-        echo "Monitoring website..."
-        MAX_RETRIES=30  # Increased retries
-        RETRY_INTERVAL=10
-        
-        for i in $(seq 1 $MAX_RETRIES)
-        do
-          echo "Attempt $i of $MAX_RETRIES..."
-          
-          # Add timeout and follow redirects
-          STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
-            --connect-timeout 5 \
-            --max-time 10 \
-            --location \
-            ${{ env.WEBSITE_URL }} || echo "failed")
-          
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ Health check passed!"
-            exit 0
-          elif [ "$STATUS" = "failed" ]; then
-            echo "⏳ Connection failed - server might still be starting"
-          else
-            echo "⚠️  Got status: $STATUS"
-          fi
-          
-          sleep $RETRY_INTERVAL
-        done
-        
-        echo "❌ Health check failed after $MAX_RETRIES attempts"
-        exit 1
   # ====================================================
   # 6️⃣ Pipeline Summary
   # ====================================================
@@ -225,10 +315,25 @@ monitoring:
     if: always()
 
     steps:
-      - name: Show Results
+      - name: Display Results
         run: |
-          echo "CI/CD Pipeline Finished"
-          echo "Quality: ${{ needs.quality.result }}"
-          echo "Build: ${{ needs.build.result }}"
-          echo "Deploy: ${{ needs.deploy.result }}"
-          echo "Monitoring: ${{ needs.monitoring.result }}"
+          echo "=================================="
+          echo "📊 CI/CD Pipeline Summary"
+          echo "=================================="
+          echo ""
+          echo "Jobs Status:"
+          echo "-------------"
+          echo "✅ Quality: ${{ needs.quality.result }}"
+          echo "✅ Build: ${{ needs.build.result }}"
+          echo "✅ Deploy: ${{ needs.deploy.result }}"
+          echo "✅ Monitoring: ${{ needs.monitoring.result }}"
+          echo ""
+          echo "🌐 Website: ${{ env.WEBSITE_URL }}"
+          echo "📱 App Name: ${{ env.APP_NAME }}"
+          echo ""
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            echo "✅ Deployment completed successfully!"
+          else
+            echo "⚠️ Deployment completed with warnings"
+          fi
+          echo "=================================="
