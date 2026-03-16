@@ -1,207 +1,241 @@
 name: Production CI/CD Pipeline
 
 on:
-  push:
-    branches: [master]
+push:
+branches:
+- master
 
 concurrency:
-  group: production-deploy
-  cancel-in-progress: false
+group: production-deploy
+cancel-in-progress: false
 
 env:
-  NODE_VERSION: 20
-  APP_PORT: 3002
-  APP_NAME: ci-cd-frontend
+NODE_VERSION: 20
+APP_PORT: 3002
+APP_NAME: ci-cd-frontend
+WEBSITE_URL: https://tekeyefrontend.clickmasters.pk
 
 jobs:
 
-# ===============================
-# 1️⃣ CODE QUALITY & SECURITY
-# ===============================
-  quality:
-    name: Code Quality & Security
-    runs-on: ubuntu-latest
+# 1️⃣ Code Quality & Tests
 
-    defaults:
-      run:
-        working-directory: frontend
+quality:
+name: Code Quality
+runs-on: ubuntu-latest
 
-    steps:
-      - uses: actions/checkout@v4
+```
+defaults:
+  run:
+    working-directory: frontend
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: npm ci
+  - name: Setup Node
+    uses: actions/setup-node@v4
+    with:
+      node-version: ${{ env.NODE_VERSION }}
+      cache: npm
+      cache-dependency-path: frontend/package-lock.json
 
-      - name: Lint code
-        run: npm run lint || true
+  - name: Install Dependencies
+    run: npm ci
 
-      - name: Security audit
-        run: npm audit --audit-level=high || true
+  - name: Run Lint
+    run: npm run lint || true
 
-      - name: Run tests
-        run: npm test || true
+  - name: Security Audit
+    run: npm audit --audit-level=high || true
 
+  - name: Run Tests
+    run: npm test || true
+```
 
-# ===============================
-# 2️⃣ BUILD APPLICATION
-# ===============================
-  build:
-    name: Build Application
-    needs: quality
-    runs-on: ubuntu-latest
+# 2️⃣ Build Application
 
-    defaults:
-      run:
-        working-directory: frontend
+build:
+name: Build Next.js App
+runs-on: ubuntu-latest
+needs: quality
 
-    steps:
-      - uses: actions/checkout@v4
+```
+defaults:
+  run:
+    working-directory: frontend
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: npm ci
+  - name: Setup Node
+    uses: actions/setup-node@v4
+    with:
+      node-version: ${{ env.NODE_VERSION }}
+      cache: npm
+      cache-dependency-path: frontend/package-lock.json
 
-      - name: Build project
-        run: npm run build
+  - name: Install Dependencies
+    run: npm ci
 
-      - name: Upload build
-        uses: actions/upload-artifact@v4
-        with:
-          name: next-build
-          path: frontend/.next
+  - name: Build Application
+    run: npm run build
 
+  - name: Upload Build Artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: next-build
+      path: frontend/.next
+```
 
-# ===============================
-# 3️⃣ APPROVAL BEFORE DEPLOY
-# ===============================
-  approval:
-    name: Manual Approval
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: production
+# 3️⃣ Manual Approval Before Production
 
-    steps:
-      - run: echo "Waiting for production approval..."
+approval:
+name: Production Approval
+needs: build
+runs-on: ubuntu-latest
 
+```
+environment:
+  name: production
+  url: ${{ env.WEBSITE_URL }}
 
-# ===============================
-# 4️⃣ DEPLOY TO VPS
-# ===============================
-  deploy:
-    name: Deploy to Production
-    needs: approval
-    runs-on: ubuntu-latest
+steps:
+  - name: Wait for Approval
+    run: echo "Waiting for production approval..."
+```
 
-    steps:
-      - uses: actions/checkout@v4
+# 4️⃣ Deploy to VPS
 
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_KEY }}
+deploy:
+name: Deploy Application
+runs-on: ubuntu-latest
+needs: approval
 
-      - name: Deploy application
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+```
+steps:
 
-          set -e
+  - name: Checkout Repository
+    uses: actions/checkout@v4
 
-          APP_DIR=${{ secrets.APP_DIR }}
+  - name: Setup SSH
+    uses: webfactory/ssh-agent@v0.9.0
+    with:
+      ssh-private-key: ${{ secrets.SSH_KEY }}
 
-          echo "Starting deployment..."
+  - name: Deploy to VPS
+    run: |
+      ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
 
-          cd $APP_DIR
+      set -e
 
-          PREVIOUS_COMMIT=$(git rev-parse HEAD)
+      echo "Loading NVM..."
 
-          echo "Backup commit: $PREVIOUS_COMMIT"
+      export NVM_DIR="$HOME/.nvm"
+      source $NVM_DIR/nvm.sh
+      nvm use 24.13.0
 
-          git fetch origin
-          git reset --hard origin/master
+      node -v
+      npm -v
 
-          echo "Installing dependencies"
-          npm install
+      APP_DIR=${{ secrets.APP_DIR }}
 
-          echo "Building application"
-          npm run build
+      cd $APP_DIR
 
-          echo "Restarting PM2"
-          pm2 restart ${{ env.APP_NAME }} || pm2 start npm --name "${{ env.APP_NAME }}" -- start
-          pm2 save
+      echo "Saving current commit..."
+      PREVIOUS_COMMIT=$(git rev-parse HEAD)
 
-          sleep 10
+      echo "Fetching latest code..."
+      git fetch origin
+      git reset --hard origin/master
 
-          STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://localhost:${{ env.APP_PORT }})
+      echo "Cleaning old build..."
+      rm -rf node_modules .next
 
-          if [ "$STATUS" != "200" ]; then
-            echo "Deployment failed. Rolling back..."
-            git reset --hard $PREVIOUS_COMMIT
-            npm install
-            npm run build
-            pm2 restart ${{ env.APP_NAME }}
-            exit 1
-          fi
+      echo "Installing dependencies..."
+      npm install
 
-          echo "Deployment successful"
+      echo "Building application..."
+      npm run build
 
-          EOF
+      echo "Restarting PM2..."
 
+      pm2 restart ${{ env.APP_NAME }} || pm2 start npm --name "${{ env.APP_NAME }}" -- start
+      pm2 save
 
-# ===============================
-# 5️⃣ POST DEPLOY HEALTH CHECK
-# ===============================
-  monitoring:
-    name: Post Deployment Monitoring
-    needs: deploy
-    runs-on: ubuntu-latest
+      echo "Waiting for app startup..."
+      sleep 15
 
-    steps:
+      echo "Running health check..."
 
-      - name: Monitor server
-        run: |
-          echo "Checking server health..."
+      STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://localhost:${{ env.APP_PORT }})
 
-          for i in {1..10}
-          do
-            STATUS=$(curl -o /dev/null -s -w "%{http_code}" https://tekeyefrontend.clickmasters.pk)
+      if [ "$STATUS" != "200" ]; then
 
-            if [ "$STATUS" != "200" ]; then
-              echo "Health check failed"
-              exit 1
-            fi
+        echo "Deployment failed. Rolling back..."
 
-            echo "Health OK"
-            sleep 15
-          done
+        git reset --hard $PREVIOUS_COMMIT
 
+        rm -rf node_modules .next
 
-# ===============================
-# 6️⃣ DEPLOYMENT SUMMARY
-# ===============================
-  summary:
-    name: Deployment Summary
-    needs: [quality, build, deploy, monitoring]
-    if: always()
-    runs-on: ubuntu-latest
+        npm install
+        npm run build
 
-    steps:
-      - name: Summary
-        run: |
-          echo "Pipeline finished"
-          echo "Quality: ${{ needs.quality.result }}"
-          echo "Build: ${{ needs.build.result }}"
-          echo "Deploy: ${{ needs.deploy.result }}"
-          echo "Monitoring: ${{ needs.monitoring.result }}"
+        pm2 restart ${{ env.APP_NAME }}
+
+        exit 1
+
+      fi
+
+      echo "Deployment successful"
+
+      EOF
+```
+
+# 5️⃣ Post Deployment Monitoring
+
+monitoring:
+name: Post Deployment Monitoring
+runs-on: ubuntu-latest
+needs: deploy
+
+```
+steps:
+
+  - name: Check Website Health
+    run: |
+
+      echo "Monitoring website..."
+
+      for i in {1..10}
+      do
+        STATUS=$(curl -o /dev/null -s -w "%{http_code}" ${{ env.WEBSITE_URL }})
+
+        if [ "$STATUS" != "200" ]; then
+          echo "Health check failed"
+          exit 1
+        fi
+
+        echo "Health OK"
+        sleep 20
+      done
+```
+
+# 6️⃣ Pipeline Summary
+
+summary:
+name: Deployment Summary
+runs-on: ubuntu-latest
+needs: [quality, build, deploy, monitoring]
+if: always()
+
+```
+steps:
+  - name: Show Results
+    run: |
+      echo "CI/CD Pipeline Finished"
+      echo "Quality: ${{ needs.quality.result }}"
+      echo "Build: ${{ needs.build.result }}"
+      echo "Deploy: ${{ needs.deploy.result }}"
+      echo "Monitoring: ${{ needs.monitoring.result }}"
+```
