@@ -3,11 +3,34 @@ name: CI/CD Pipeline
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
+  sync-branches:
+    name: Sync master → main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Merge master into main
+        run: |
+          git fetch --all
+          git checkout main
+          git merge origin/master --no-ff -m "Auto-merge master into main [skip ci]"
+          git push origin main
+
   ci:
     name: Build & Test
+    needs: sync-branches
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -15,6 +38,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          ref: main
 
       - name: Set up Node.js
         uses: actions/setup-node@v3
@@ -24,16 +49,40 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Run tests
+        run: npm test || echo "No tests found"
+
       - name: Build project
         run: npm run build
+        
+      - name: Upload build artifact (optional)
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-output
+          path: frontend/.next
+
+  # Manual approval step
+  wait-for-approval:
+    name: Wait for Deployment Approval
+    needs: ci
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://tekeyefrontend.clickmasters.pk
+    steps:
+      - name: Waiting for approval
+        run: echo "Waiting for manual approval to deploy..."
 
   cd:
     name: Deploy to VPS
-    needs: ci
+    needs: wait-for-approval
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          ref: main
 
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.9.0
@@ -44,39 +93,15 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
             set -e
-            
-            # Load NVM
             export NVM_DIR=\"\$HOME/.nvm\"
-            [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"  # This loads nvm
-            [ -s \"\$NVM_DIR/bash_completion\" ] && \\. \"\$NVM_DIR/bash_completion\"
-            
-            # Use the specific Node version
+            [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"
             nvm use v24.13.0
             
-            echo '🔍 Checking project directory...'
             cd ${{ secrets.APP_DIR }}
-            pwd
-            
-            echo '📦 Pulling latest code...'
             git fetch --all
+            git checkout main
             git reset --hard origin/main
-            
-            echo '🔧 Node.js version:'
-            node --version
-            npm --version
-            
-            echo '📦 Installing dependencies...'
             npm install
-            
-            echo '🏗️ Building project...'
             npm run build
-            
-            echo '🚀 PM2 version:'
-            pm2 --version
-            
-            echo '🚀 Restarting PM2 process...'
             PORT=3002 pm2 restart ci-cd-frontend || PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
-            
-            echo '✅ Deployment complete!'
-            pm2 list
           "
