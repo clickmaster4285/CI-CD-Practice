@@ -17,7 +17,11 @@ WEBSITE_URL: https://tekeyefrontend.clickmasters.pk
 
 jobs:
 
+# ====================================================
+
 # 1️⃣ Code Quality & Tests
+
+# ====================================================
 
 quality:
 name: Code Quality
@@ -52,7 +56,11 @@ steps:
     run: npm test || true
 ```
 
+# ====================================================
+
 # 2️⃣ Build Application
+
+# ====================================================
 
 build:
 name: Build Next.js App
@@ -88,7 +96,11 @@ steps:
       path: frontend/.next
 ```
 
+# ====================================================
+
 # 3️⃣ Manual Approval Before Production
+
+# ====================================================
 
 approval:
 name: Production Approval
@@ -105,7 +117,11 @@ steps:
     run: echo "Waiting for production approval..."
 ```
 
+# ====================================================
+
 # 4️⃣ Deploy to VPS
+
+# ====================================================
 
 deploy:
 name: Deploy Application
@@ -192,7 +208,11 @@ steps:
       EOF
 ```
 
+# ====================================================
+
 # 5️⃣ Post Deployment Monitoring
+
+# ====================================================
 
 monitoring:
 name: Post Deployment Monitoring
@@ -221,7 +241,11 @@ steps:
       done
 ```
 
+# ====================================================
+
 # 6️⃣ Pipeline Summary
+
+# ====================================================
 
 summary:
 name: Deployment Summary
