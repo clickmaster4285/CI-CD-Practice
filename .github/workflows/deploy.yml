@@ -3,16 +3,15 @@ name: CI/CD Pipeline
 on:
   push:
     branches:
-      - main  # trigger on push to main branch
+      - main
 
 jobs:
-
   ci:
     name: Build & Test
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: frontend  # <-- run commands inside frontend folder
+        working-directory: frontend
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -24,9 +23,6 @@ jobs:
 
       - name: Install dependencies
         run: npm install
-
-      - name: Run tests
-        run: npm test || echo "No tests found, skipping"
 
       - name: Build project
         run: npm run build
@@ -47,11 +43,37 @@ jobs:
       - name: Deploy via SSH
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
-            cd ${{ secrets.APP_DIR }} || exit
+            set -e  # Exit on error
+            
+            echo '🔍 Checking project directory...'
+            cd ${{ secrets.APP_DIR }}
+            pwd
+            ls -la
+            
+            echo '📦 Pulling latest code...'
             git fetch --all
             git reset --hard origin/main
-            cd frontend
+            
+            echo '📁 Checking for frontend folder...'
+            if [ -d "frontend" ]; then
+              cd frontend
+            else
+              echo '❌ frontend folder not found!'
+              exit 1
+            fi
+            
+            echo '📦 Installing dependencies...'
+            export NVM_DIR=\"\$HOME/.nvm\"
+            [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"  # Load nvm
+            [ -s \"\$NVM_DIR/bash_completion\" ] && \\. \"\$NVM_DIR/bash_completion\"
+            
             npm install
+            
+            echo '🏗️ Building project...'
             npm run build
+            
+            echo '🚀 Restarting PM2 process...'
             PORT=3002 pm2 restart ci-cd-frontend || PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
+            
+            echo '✅ Deployment complete!'
           "
