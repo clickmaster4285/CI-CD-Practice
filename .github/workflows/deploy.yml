@@ -27,7 +27,7 @@ quality:
 name: Code Quality
 runs-on: ubuntu-latest
 
-```
+
 defaults:
   run:
     working-directory: frontend
@@ -54,7 +54,7 @@ steps:
 
   - name: Run Tests
     run: npm test || true
-```
+
 
 # ====================================================
 
@@ -67,7 +67,7 @@ name: Build Next.js App
 runs-on: ubuntu-latest
 needs: quality
 
-```
+
 defaults:
   run:
     working-directory: frontend
@@ -94,7 +94,7 @@ steps:
     with:
       name: next-build
       path: frontend/.next
-```
+
 
 # ====================================================
 
@@ -107,7 +107,7 @@ name: Production Approval
 needs: build
 runs-on: ubuntu-latest
 
-```
+
 environment:
   name: production
   url: ${{ env.WEBSITE_URL }}
@@ -115,7 +115,7 @@ environment:
 steps:
   - name: Wait for Approval
     run: echo "Waiting for production approval..."
-```
+
 
 # ====================================================
 
@@ -128,9 +128,8 @@ name: Deploy Application
 runs-on: ubuntu-latest
 needs: approval
 
-```
-steps:
 
+steps:
   - name: Checkout Repository
     uses: actions/checkout@v4
 
@@ -187,7 +186,6 @@ steps:
       STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://localhost:${{ env.APP_PORT }})
 
       if [ "$STATUS" != "200" ]; then
-
         echo "Deployment failed. Rolling back..."
 
         git reset --hard $PREVIOUS_COMMIT
@@ -200,13 +198,12 @@ steps:
         pm2 restart ${{ env.APP_NAME }}
 
         exit 1
-
       fi
 
       echo "Deployment successful"
 
       EOF
-```
+
 
 # ====================================================
 
@@ -219,12 +216,10 @@ name: Post Deployment Monitoring
 runs-on: ubuntu-latest
 needs: deploy
 
-```
-steps:
 
+steps:
   - name: Check Website Health
     run: |
-
       echo "Monitoring website..."
 
       for i in {1..10}
@@ -239,7 +234,7 @@ steps:
         echo "Health OK"
         sleep 20
       done
-```
+
 
 # ====================================================
 
@@ -253,7 +248,7 @@ runs-on: ubuntu-latest
 needs: [quality, build, deploy, monitoring]
 if: always()
 
-```
+
 steps:
   - name: Show Results
     run: |
@@ -262,4 +257,4 @@ steps:
       echo "Build: ${{ needs.build.result }}"
       echo "Deploy: ${{ needs.deploy.result }}"
       echo "Monitoring: ${{ needs.monitoring.result }}"
-```
+
