@@ -97,7 +97,7 @@ export default function Home() {
     <div className="flex min-h-screen items-center justify-center bg-zinc-50">
       <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white">
         <Image
-          src="/next.svg"
+          src="/next.svg"     
           alt="Next.js logo"
           width={100}
           height={20}

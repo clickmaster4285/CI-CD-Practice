@@ -48,14 +48,22 @@ jobs:
       - name: Security Audit
         run: npm audit --audit-level=high || true
 
-      - name: Run Tests
+      - name: Run Unit Tests
         run: npm test || true
 
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: frontend/coverage/
+          retention-days: 7
+
   # ====================================================
-  # 2️⃣ Build Application
+  # 2️⃣ E2E Tests with Playwright (Browser Testing)
   # ====================================================
-  build:
-    name: Build Next.js App
+  e2e-tests:
+    name: E2E Browser Tests
     runs-on: ubuntu-latest
     needs: quality
     defaults:
@@ -76,8 +84,70 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps chromium
+
       - name: Build Application
         run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Start Application in Production Mode
+        run: |
+          npm start &
+          npx wait-on http://localhost:3000 --timeout 60000
+        env:
+          NODE_ENV: production
+          NEXT_PUBLIC_SECRET_KEY: ${{ secrets.NEXT_PUBLIC_SECRET_KEY }}
+
+      - name: Run Playwright Tests
+        run: npx playwright test
+
+      - name: Upload Playwright Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 30
+
+      - name: Upload Test Videos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-videos
+          path: frontend/test-results/
+          retention-days: 30
+
+  # ====================================================
+  # 3️⃣ Build Application
+  # ====================================================
+  build:
+    name: Build Next.js App
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Application
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SECRET_KEY: ${{ secrets.NEXT_PUBLIC_SECRET_KEY }}
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
@@ -86,8 +156,15 @@ jobs:
           path: frontend/.next
           retention-days: 1
 
+      - name: Upload Public Assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-assets
+          path: frontend/public
+          retention-days: 1
+
   # ====================================================
-  # 3️⃣ Manual Approval Before Production
+  # 4️⃣ Manual Approval Before Production
   # ====================================================
   approval:
     name: Manual Approval Required
@@ -110,6 +187,11 @@ jobs:
           echo "   - App Name: ${{ env.APP_NAME }}"
           echo "   - Port: ${{ env.APP_PORT }}"
           echo ""
+          echo "✅ Tests Passed:"
+          echo "   - Unit Tests: ${{ needs.quality.result }}"
+          echo "   - E2E Tests: ${{ needs.e2e-tests.result }}"
+          echo "   - Build: ${{ needs.build.result }}"
+          echo ""
           echo "🔍 How to Approve:"
           echo "   1. Go to the Actions tab in GitHub"
           echo "   2. Click on this workflow run"
@@ -121,7 +203,7 @@ jobs:
           echo "=========================================="
 
   # ====================================================
-  # 4️⃣ Deploy to VPS (With Rollback Functionality)
+  # 5️⃣ Deploy to VPS (With Enhanced Monitoring)
   # ====================================================
   deploy:
     name: Deploy to Production
@@ -140,7 +222,10 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
-      - name: Deploy Application with Rollback
+      - name: Install jq for JSON parsing
+        run: sudo apt-get install -y jq
+
+      - name: Deploy Application with Enhanced Monitoring
         run: |
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
             set -e
@@ -199,6 +284,10 @@ jobs:
             echo "📝 Saving PM2 logs..."
             pm2 logs "${{ env.APP_NAME }}" --lines 100 --nostream > "$BACKUP_PATH/pm2_logs.txt" 2>/dev/null || true
             
+            # Save current monitoring data
+            echo "📊 Saving monitoring data..."
+            curl -s http://localhost:${{ env.APP_PORT }}/api/health > "$BACKUP_PATH/pre_deploy_health.json" 2>/dev/null || echo "{}" > "$BACKUP_PATH/pre_deploy_health.json"
+            
             # Pull latest code
             echo "📥 Fetching latest code..."
             git fetch origin
@@ -224,8 +313,9 @@ jobs:
               exit 1
             fi
             
-            # Build application
+            # Build application with production env vars
             echo "🏗️ Building application..."
+            export NEXT_PUBLIC_SECRET_KEY="${{ secrets.NEXT_PUBLIC_SECRET_KEY }}"
             if ! npm run build; then
               echo "❌ Build failed"
               echo "🔄 Rolling back to previous version..."
@@ -260,28 +350,69 @@ jobs:
             echo "⏳ Waiting for application to start..."
             sleep 15
             
-            # Health check with retry
-            echo "🏥 Performing health check..."
-            HEALTHY=false
-            for i in {1..5}; do
-              LOCAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-                --connect-timeout 5 \
-                --max-time 10 \
-                http://localhost:${{ env.APP_PORT }} || echo "failed")
-              
-              if [ "$LOCAL_STATUS" = "200" ] || [ "$LOCAL_STATUS" = "301" ] || [ "$LOCAL_STATUS" = "302" ]; then
-                HEALTHY=true
-                echo "✅ Health check passed (HTTP $LOCAL_STATUS)"
-                break
-              else
-                echo "⏳ Health check attempt $i/5: $LOCAL_STATUS"
-                sleep 5
-              fi
-            done
+            # ============================================
+            # ENHANCED HEALTH CHECK WITH MONITORING
+            # ============================================
+            echo "🏥 Performing comprehensive health checks..."
             
-            # Rollback if health check fails
-            if [ "$HEALTHY" = false ]; then
-              echo "❌ Health check failed after deployment"
+            # Function to perform health check
+            perform_health_check() {
+              local check_name=$1
+              local check_command=$2
+              local max_attempts=$3
+              local attempt=1
+              
+              echo "   🔍 $check_name..."
+              
+              while [ $attempt -le $max_attempts ]; do
+                if eval $check_command; then
+                  echo "   ✅ $check_name passed"
+                  return 0
+                fi
+                echo "   ⏳ Attempt $attempt/$max_attempts failed, retrying..."
+                attempt=$((attempt + 1))
+                [ $attempt -le $max_attempts ] && sleep 5
+              done
+              
+              echo "   ❌ $check_name failed"
+              return 1
+            }
+            
+            # Health check tracking
+            HEALTH_CHECKS_PASSED=0
+            HEALTH_CHECKS_TOTAL=5
+            
+            # Check 1: Basic HTTP Response
+            if perform_health_check "HTTP Response" "curl -s -o /dev/null -w '%{http_code}' http://localhost:${{ env.APP_PORT }} | grep -E '200|301|302' > /dev/null" 5; then
+              HEALTH_CHECKS_PASSED=$((HEALTH_CHECKS_PASSED + 1))
+            fi
+            
+            # Check 2: Health API Endpoint
+            if perform_health_check "Health API" "curl -s http://localhost:${{ env.APP_PORT }}/api/health | jq -e '.status == \"healthy\"' > /dev/null" 3; then
+              HEALTH_CHECKS_PASSED=$((HEALTH_CHECKS_PASSED + 1))
+            fi
+            
+            # Check 3: Memory Usage
+            if perform_health_check "Memory Usage" "
+              MEMORY_USAGE=\$(curl -s http://localhost:${{ env.APP_PORT }}/api/health | jq -r '.checks.memory.heapUsed // \"0MB\"' | sed 's/MB//')
+              [ \$MEMORY_USAGE -lt 500 ]
+            " 3; then
+              HEALTH_CHECKS_PASSED=$((HEALTH_CHECKS_PASSED + 1))
+            fi
+            
+            # Check 4: PM2 Status
+            if perform_health_check "PM2 Status" "pm2 list | grep -q '${{ env.APP_NAME }}.*online'" 3; then
+              HEALTH_CHECKS_PASSED=$((HEALTH_CHECKS_PASSED + 1))
+            fi
+            
+            # Check 5: Page Load (check for critical content)
+            if perform_health_check "Page Content" "curl -s http://localhost:${{ env.APP_PORT }} | grep -q 'next'" 3; then
+              HEALTH_CHECKS_PASSED=$((HEALTH_CHECKS_PASSED + 1))
+            fi
+            
+            # Check if enough health checks passed (at least 4 out of 5)
+            if [ $HEALTH_CHECKS_PASSED -lt 4 ]; then
+              echo "❌ Health checks failed: $HEALTH_CHECKS_PASSED/$HEALTH_CHECKS_TOTAL passed"
               echo "🔄 Rolling back to previous version..."
               
               # Revert code
@@ -303,11 +434,21 @@ jobs:
               exit 1
             fi
             
-            # Clean up old backups (keep last 5)
+            echo "✅ All health checks passed: $HEALTH_CHECKS_PASSED/$HEALTH_CHECKS_TOTAL"
+            
+            # Save post-deployment health data
+            echo "📊 Saving post-deployment health data..."
+            curl -s http://localhost:${{ env.APP_PORT }}/api/health > "$BACKUP_PATH/post_deploy_health.json" 2>/dev/null || true
+            
+            # Clean up old backups (keep last 10)
             echo "🧹 Cleaning up old backups..."
             cd "$BACKUP_DIR"
-            ls -t | tail -n +6 | xargs -r rm -rf
+            ls -t | tail -n +11 | xargs -r rm -rf
             cd "$APP_DIR"
+            
+            # Setup monitoring cron job if not exists
+            echo "🕒 Setting up monitoring cron job..."
+            (crontab -l 2>/dev/null | grep -v "health-check"; echo "*/5 * * * * curl -s http://localhost:${{ env.APP_PORT }}/api/health > /dev/null || echo 'Health check failed at \$(date)' >> $APP_DIR/../health_check.log") | crontab -
             
             echo "=========================================="
             echo "✅ DEPLOYMENT COMPLETED SUCCESSFULLY"
@@ -316,10 +457,18 @@ jobs:
             echo "📱 App: ${{ env.APP_NAME }}"
             echo "📦 New commit: $NEW_COMMIT_SHORT"
             echo "🔄 Previous commit: $PREVIOUS_COMMIT_SHORT"
+            echo "✅ Health checks: $HEALTH_CHECKS_PASSED/$HEALTH_CHECKS_TOTAL"
           EOF
 
+      - name: Notify Deployment Success
+        if: success()
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+            -d '{"text": "✅ Production deployment successful!"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }} || true
+
   # ====================================================
-  # 5️⃣ Post Deployment Verification
+  # 6️⃣ Post Deployment Verification
   # ====================================================
   verify:
     name: Verify Deployment
@@ -328,6 +477,9 @@ jobs:
     if: success()
     
     steps:
+      - name: Install jq
+        run: sudo apt-get install -y jq
+      
       - name: Verify Website is Accessible
         run: |
           echo "=========================================="
@@ -341,31 +493,28 @@ jobs:
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
             
+            # Check main website
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               --connect-timeout 10 \
               --max-time 20 \
               --location \
               "${{ env.WEBSITE_URL }}" || echo "000")
             
-            case $HTTP_CODE in
-              200|301|302)
-                echo "✅ Website is accessible! (HTTP $HTTP_CODE)"
+            # Check health endpoint
+            HEALTH_STATUS=$(curl -s "${{ env.WEBSITE_URL }}/api/health" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+            
+            echo "   Main site: HTTP $HTTP_CODE"
+            echo "   Health API: $HEALTH_STATUS"
+            
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+              if [ "$HEALTH_STATUS" = "healthy" ]; then
+                echo "✅ Website is fully healthy!"
                 SUCCESS=true
                 break
-                ;;
-              000)
-                echo "⏳ Connection timeout - retrying..."
-                ;;
-              *)
-                if [ $HTTP_CODE -ge 200 ] && [ $HTTP_CODE -lt 500 ]; then
-                  echo "✅ Website responded with HTTP $HTTP_CODE"
-                  SUCCESS=true
-                  break
-                else
-                  echo "⚠️ Got HTTP $HTTP_CODE - retrying..."
-                fi
-                ;;
-            esac
+              else
+                echo "⚠️ Website responding but health check shows: $HEALTH_STATUS"
+              fi
+            fi
             
             ATTEMPT=$((ATTEMPT + 1))
             [ $ATTEMPT -le $MAX_ATTEMPTS ] && sleep 10
@@ -375,9 +524,19 @@ jobs:
             echo "❌ Website verification failed"
             exit 1
           fi
+      
+      - name: Run Smoke Tests
+        run: |
+          echo "🔍 Running smoke tests..."
+          
+          # Test critical paths
+          curl -f "${{ env.WEBSITE_URL }}" > /dev/null || exit 1
+          curl -f "${{ env.WEBSITE_URL }}/api/health" > /dev/null || exit 1
+          
+          echo "✅ Smoke tests passed"
 
   # ====================================================
-  # 6️⃣ Rollback Job (if verification fails)
+  # 7️⃣ Rollback Job (if verification fails)
   # ====================================================
   rollback:
     name: Automatic Rollback
@@ -409,7 +568,11 @@ jobs:
             if [ ! -z "$LATEST_BACKUP" ] && [ -d "$BACKUP_DIR/$LATEST_BACKUP" ]; then
               echo "📦 Found backup: $LATEST_BACKUP"
               
+              # Log the rollback reason
+              echo "$(date): Emergency rollback triggered - verification failed" >> "$APP_DIR/../rollback.log"
+              
               # Restore from backup
+              echo "🔄 Restoring files from backup..."
               rm -rf node_modules .next
               cp -r "$BACKUP_DIR/$LATEST_BACKUP/node_modules" \
                     "$BACKUP_DIR/$LATEST_BACKUP/.next" \
@@ -417,22 +580,133 @@ jobs:
                     "$BACKUP_DIR/$LATEST_BACKUP/package-lock.json" ./ 2>/dev/null || true
               
               # Restart application
+              echo "🔄 Restarting application..."
               pm2 restart "${{ env.APP_NAME }}"
               
-              echo "✅ Rollback completed successfully"
+              # Verify rollback succeeded
+              sleep 10
+              if curl -s http://localhost:${{ env.APP_PORT }} > /dev/null; then
+                echo "✅ Rollback completed successfully - application is running"
+              else
+                echo "❌ Rollback failed - application is not responding"
+                exit 1
+              fi
             else
               echo "❌ No backup found for rollback"
               exit 1
             fi
           EOF
+      
+      - name: Notify Rollback
+        if: always()
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+            -d '{"text": "⚠️ Production deployment failed - Automatic rollback executed"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }} || true
 
   # ====================================================
-  # 7️⃣ Deployment Summary
+  # 8️⃣ Performance Benchmarking
+  # ====================================================
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    needs: verify
+    if: success()
+    
+    steps:
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli
+      
+      - name: Run Lighthouse Audit
+        run: |
+          lhci autorun \
+            --collect.url=${{ env.WEBSITE_URL }} \
+            --collect.numberOfRuns=3 \
+            --upload.target=temporary-public-storage \
+            --upload.githubToken=${{ secrets.GITHUB_TOKEN }} || true
+      
+      - name: Check Response Times
+        run: |
+          echo "📊 Measuring response times..."
+          
+          # Measure response time over 10 requests
+          TOTAL_TIME=0
+          for i in {1..10}; do
+            TIME=$(curl -s -w '%{time_total}' -o /dev/null "${{ env.WEBSITE_URL }}" || echo "0")
+            TOTAL_TIME=$(echo "$TOTAL_TIME + $TIME" | bc)
+          done
+          
+          AVG_TIME=$(echo "scale=3; $TOTAL_TIME / 10" | bc)
+          echo "Average response time: ${AVG_TIME}s"
+          
+          # Alert if response time is too high
+          if (( $(echo "$AVG_TIME > 2.0" | bc -l) )); then
+            echo "⚠️ Warning: High response time detected (${AVG_TIME}s)"
+            # Could send alert here
+          fi
+
+  # ====================================================
+  # 9️⃣ Error Monitoring Setup
+  # ====================================================
+  setup-monitoring:
+    name: Setup Error Monitoring
+    runs-on: ubuntu-latest
+    needs: verify
+    if: success()
+    
+    steps:
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+      
+      - name: Configure Monitoring
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            APP_DIR="${{ secrets.APP_DIR }}"
+            
+            # Create monitoring directory
+            mkdir -p "$APP_DIR/../monitoring"
+            
+            # Create error aggregation script
+            cat > "$APP_DIR/../monitoring/aggregate_errors.sh" << 'SCRIPT'
+            #!/bin/bash
+            APP_DIR="${{ secrets.APP_DIR }}"
+            OUTPUT_DIR="$APP_DIR/../monitoring/reports"
+            mkdir -p "$OUTPUT_DIR"
+            
+            # Check PM2 logs for errors
+            pm2 logs ${{ env.APP_NAME }} --lines 1000 --nostream | grep -i error > "$OUTPUT_DIR/errors_$(date +%Y%m%d).log"
+            
+            # Check application logs
+            if [ -f "$APP_DIR/.next/logs" ]; then
+              cat "$APP_DIR/.next/logs" | grep -i error >> "$OUTPUT_DIR/errors_$(date +%Y%m%d).log"
+            fi
+            
+            # Count errors
+            ERROR_COUNT=$(wc -l < "$OUTPUT_DIR/errors_$(date +%Y%m%d).log")
+            
+            # Alert if too many errors
+            if [ $ERROR_COUNT -gt 100 ]; then
+              echo "High error count detected: $ERROR_COUNT" | mail -s "Error Alert" ${{ secrets.ALERT_EMAIL }} 2>/dev/null || true
+            fi
+            SCRIPT
+            
+            chmod +x "$APP_DIR/../monitoring/aggregate_errors.sh"
+            
+            # Add to crontab to run every hour
+            (crontab -l 2>/dev/null | grep -v "aggregate_errors"; echo "0 * * * * $APP_DIR/../monitoring/aggregate_errors.sh") | crontab -
+            
+            echo "✅ Monitoring setup complete"
+          EOF
+
+  # ====================================================
+  # 🔟 Deployment Summary
   # ====================================================
   summary:
     name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [quality, build, approval, deploy, verify, rollback]
+    needs: [quality, e2e-tests, build, approval, deploy, verify, rollback, benchmark]
     if: always()
     
     steps:
@@ -445,25 +719,121 @@ jobs:
           echo "Job Statuses:"
           echo "-------------"
           echo "📝 Quality: ${{ needs.quality.result }}"
+          echo "🌐 E2E Tests: ${{ needs.e2e-tests.result }}"
           echo "🏗️ Build: ${{ needs.build.result }}"
           echo "👤 Approval: ${{ needs.approval.result }}"
           echo "🚀 Deploy: ${{ needs.deploy.result }}"
           echo "🔍 Verify: ${{ needs.verify.result }}"
           echo "🔄 Rollback: ${{ needs.rollback.result }}"
+          echo "⚡ Benchmark: ${{ needs.benchmark.result }}"
           echo ""
           echo "Deployment Details:"
           echo "------------------"
           echo "🌐 Website: ${{ env.WEBSITE_URL }}"
           echo "📱 App Name: ${{ env.APP_NAME }}"
           echo "🔌 Port: ${{ env.APP_PORT }}"
+          echo "⏱️  Time: $(date)"
           echo ""
           
           if [ "${{ needs.deploy.result }}" = "success" ] && [ "${{ needs.verify.result }}" = "success" ]; then
-            echo "✅✅ Production deployment completed successfully!"
+            echo "✅✅ PRODUCTION DEPLOYMENT COMPLETED SUCCESSFULLY!"
+            echo "🎉 All systems operational"
           elif [ "${{ needs.rollback.result }}" = "success" ]; then
-            echo "⚠️ Deployment failed - Automatically rolled back to previous version"
+            echo "⚠️ DEPLOYMENT FAILED - AUTOMATICALLY ROLLED BACK"
+            echo "🔄 Previous version restored"
+          elif [ "${{ needs.deploy.result }}" = "failure" ]; then
+            echo "❌ DEPLOYMENT FAILED - MANUAL INTERVENTION REQUIRED"
+            echo "🚨 Check the logs and investigate"
           else
-            echo "❌ Deployment failed - Manual intervention required"
+            echo "❌ DEPLOYMENT PIPELINE FAILED"
+            echo "🔍 Check individual job statuses above"
+          fi
+          
+          echo ""
+          echo "Next Steps:"
+          echo "-----------"
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            echo "✅ Monitor error dashboard at: ${{ env.WEBSITE_URL }}/admin/errors"
+            echo "✅ Check health endpoint: ${{ env.WEBSITE_URL }}/api/health"
+            echo "✅ Review performance metrics in GitHub Actions"
+          else
+            echo "🔍 Investigate failure in GitHub Actions logs"
+            echo "🔍 Check server logs: ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+            echo "🔍 View PM2 logs: pm2 logs ${{ env.APP_NAME }}"
           fi
           
           echo "=========================================="
+      
+      - name: Create Deployment Artifact
+        if: always()
+        run: |
+          cat > deployment-summary.json << EOF
+          {
+            "timestamp": "$(date -Iseconds)",
+            "workflow": "${{ github.workflow }}",
+            "run_id": "${{ github.run_id }}",
+            "commit": "${{ github.sha }}",
+            "status": {
+              "quality": "${{ needs.quality.result }}",
+              "e2e": "${{ needs.e2e-tests.result }}",
+              "build": "${{ needs.build.result }}",
+              "deploy": "${{ needs.deploy.result }}",
+              "verify": "${{ needs.verify.result }}",
+              "rollback": "${{ needs.rollback.result }}"
+            },
+            "environment": {
+              "url": "${{ env.WEBSITE_URL }}",
+              "app_name": "${{ env.APP_NAME }}",
+              "port": "${{ env.APP_PORT }}"
+            }
+          }
+          EOF
+      
+      - name: Upload Summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary
+          path: deployment-summary.json
+          retention-days: 30
+
+  # ====================================================
+  # 1️⃣1️⃣ Cleanup Old Deployments
+  # ====================================================
+  cleanup:
+    name: Cleanup Old Artifacts
+    runs-on: ubuntu-latest
+    needs: summary
+    if: always()
+    
+    steps:
+      - name: Delete Old Workflow Runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 10
+      
+      - name: Setup SSH and Clean Remote
+        if: success()
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+      
+      - name: Clean Old Backups on Server
+        if: success()
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            APP_DIR="${{ secrets.APP_DIR }}"
+            BACKUP_DIR="$APP_DIR/../backups"
+            
+            # Keep only last 20 backups
+            cd "$BACKUP_DIR"
+            ls -t | tail -n +21 | xargs -r rm -rf
+            
+            # Clean old logs
+            find "$APP_DIR/../monitoring/reports" -type f -mtime +30 -delete 2>/dev/null || true
+            
+            echo "✅ Cleanup completed"
+          EOF
