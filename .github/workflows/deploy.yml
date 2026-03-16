@@ -43,16 +43,19 @@ jobs:
       - name: Deploy via SSH
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
-            set -e  # Exit on error
+            set -e
             
             echo '🔍 Checking project directory...'
             cd ${{ secrets.APP_DIR }}
             pwd
-            ls -la
             
             echo '📦 Pulling latest code...'
             git fetch --all
             git reset --hard origin/main
+            
+            echo '🔧 Node.js version:'
+            node --version
+            npm --version
             
             echo '📦 Installing dependencies...'
             npm install
@@ -60,8 +63,12 @@ jobs:
             echo '🏗️ Building project...'
             npm run build
             
+            echo '🚀 PM2 version:'
+            pm2 --version
+            
             echo '🚀 Restarting PM2 process...'
             PORT=3002 pm2 restart ci-cd-frontend || PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
             
             echo '✅ Deployment complete!'
+            pm2 list
           "
