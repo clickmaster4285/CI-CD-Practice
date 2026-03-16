@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline with Auto-Rollback
 
 on:
   push:
@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4  # Updated to v4
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
@@ -46,13 +46,13 @@ jobs:
         working-directory: frontend
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # Updated to v4
         with:
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4  # Updated to v4
         with:
           node-version: 20
           cache: 'npm'
@@ -71,7 +71,7 @@ jobs:
         run: npm run build
         
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # Updated to v4 (FIXES THE ERROR!)
         with:
           name: build-output
           path: frontend/.next
@@ -93,13 +93,13 @@ jobs:
           echo "🌐 Website: https://tekeyefrontend.clickmasters.pk"
 
   cd:
-    name: Deploy to VPS
+    name: Deploy to VPS with Auto-Rollback
     needs: wait-for-approval
     runs-on: ubuntu-latest
     environment: production
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # Updated to v4
         with:
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
@@ -109,14 +109,40 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
-      - name: Deploy via SSH to VPS
+      # Step 1: Get current version (for rollback)
+      - name: Get current commit hash from VPS
+        id: get-current-version
+        run: |
+          echo "🔖 Getting current commit hash from VPS..."
+          CURRENT_HASH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+            cd ${{ secrets.APP_DIR }} && git rev-parse HEAD
+          ")
+          echo "current_hash=$CURRENT_HASH" >> $GITHUB_OUTPUT
+          echo "Current version: $CURRENT_HASH"
+
+      # Step 2: Get current PM2 status (for monitoring)
+      - name: Get current PM2 status
+        id: get-pm2-status
+        continue-on-error: true
+        run: |
+          echo "📊 Getting current PM2 status..."
+          PM2_STATUS=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+            cd ${{ secrets.APP_DIR }}
+            pm2 jlist | jq -r '.[] | select(.name == \"ci-cd-frontend\") | .pm2_env.status' 2>/dev/null || echo 'unknown'
+          ")
+          echo "pm2_status=$PM2_STATUS" >> $GITHUB_OUTPUT
+          echo "Current PM2 status: $PM2_STATUS"
+
+      # Step 3: Deploy new version (with continue-on-error)
+      - name: Deploy new version via SSH
+        id: deploy
+        continue-on-error: true
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
             set -e
             
-            echo '🚀 Starting deployment...'
-            echo '📂 Current directory:'
-            pwd
+            echo '🚀 Starting deployment of new version...'
+            echo '📂 Current directory:' \$(pwd)
             
             # Load NVM
             echo '🔄 Loading NVM...'
@@ -134,12 +160,9 @@ jobs:
             nvm use v24.13.0 2>/dev/null || echo 'Using Node from PATH'
             
             # Show versions
-            echo '🔧 Node version:'
-            node --version
-            echo '🔧 npm version:'
-            npm --version
-            echo '🔧 PM2 version:'
-            pm2 --version
+            echo '🔧 Node version:' \$(node --version)
+            echo '🔧 npm version:' \$(npm --version)
+            echo '🔧 PM2 version:' \$(pm2 --version)
             
             # Navigate to project directory
             echo '📂 Changing to project directory...'
@@ -151,9 +174,7 @@ jobs:
             git fetch --all
             git checkout main
             git reset --hard origin/main
-            echo '✅ Latest code pulled:'
-            git log -1 --pretty=format:'%h - %s (%ci)' 
-            echo ''
+            echo '✅ Latest code pulled:' \$(git log -1 --pretty=format:'%h - %s (%ci)')
             
             # Install dependencies
             echo '📦 Installing dependencies...'
@@ -163,7 +184,14 @@ jobs:
             echo '🏗️ Building project...'
             npm run build
             
-            # Check if PM2 process exists and restart/start
+            # Test the build locally before restarting
+            echo '🧪 Testing build...'
+            if [ ! -d \".next\" ]; then
+              echo '❌ Build failed - .next directory not found!'
+              exit 1
+            fi
+            
+            # Restart PM2 with new code
             echo '🚀 Managing PM2 process...'
             if pm2 list | grep -q 'ci-cd-frontend'; then
               echo '🔄 Restarting existing PM2 process...'
@@ -176,22 +204,109 @@ jobs:
             # Save PM2 configuration
             pm2 save
             
-            # Show PM2 status
-            echo '📊 PM2 Process Status:'
-            pm2 list
+            # Wait for app to start
+            echo '⏳ Waiting for application to start...'
+            sleep 10
             
             # Test if application is running
             echo '🌐 Testing application...'
-            sleep 5
-            curl -f http://localhost:3002 || echo '⚠️ Application not responding yet, but PM2 should restart it'
+            HTTP_STATUS=\$(curl -o /dev/null -s -w \"%{http_code}\" http://localhost:3002)
+            if [ \"\$HTTP_STATUS\" -eq 200 ] || [ \"\$HTTP_STATUS\" -eq 301 ] || [ \"\$HTTP_STATUS\" -eq 302 ]; then
+              echo \"✅ Application is responding with HTTP \$HTTP_STATUS\"
+            else
+              echo \"❌ Application is not responding correctly! HTTP \$HTTP_STATUS\"
+              exit 1
+            fi
             
-            echo '✅ Deployment completed successfully!'
-            echo '🌎 Website: https://tekeyefrontend.clickmasters.pk'
+            echo '✅ New version deployed successfully!'
           "
 
-      - name: Send deployment notification
+      # Step 4: Rollback on failure
+      - name: ⚠️ Rollback to previous version (deployment failed)
+        if: steps.deploy.outcome == 'failure'
         run: |
-          echo "✅ Deployment successful!"
-          echo "📦 Branch: main"
-          echo "🔗 Website: https://tekeyefrontend.clickmasters.pk"
+          echo "❌ DEPLOYMENT FAILED! Starting automatic rollback..."
+          echo "🔄 Rolling back to version: ${{ steps.get-current-version.outputs.current_hash }}"
+          
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+            set -e
+            
+            echo '🔄 Loading NVM for rollback...'
+            export NVM_DIR=\"\$HOME/.nvm\"
+            [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"
+            
+            cd ${{ secrets.APP_DIR }}
+            
+            echo '📦 Fetching previous version...'
+            git fetch --all
+            git checkout ${{ steps.get-current-version.outputs.current_hash }}
+            
+            echo '📦 Installing dependencies for previous version...'
+            npm ci --only=production || npm install
+            
+            echo '🏗️ Building previous version...'
+            npm run build
+            
+            echo '🚀 Restarting PM2 with previous version...'
+            PORT=3002 pm2 restart ci-cd-frontend
+            
+            echo '✅ Rollback completed. Application is now at previous stable version.'
+          "
+          
+          echo "⚠️ Rollback process finished. Deployment marked as failed."
+
+      # Step 5: Verify final status
+      - name: Verify final deployment status
+        id: verify
+        run: |
+          if [[ "${{ steps.deploy.outcome }}" == "failure" ]]; then
+            echo "❌ Deployment failed and rollback was performed."
+            echo "🔙 Application rolled back to: ${{ steps.get-current-version.outputs.current_hash }}"
+            
+            # Get current version after rollback
+            FINAL_HASH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+              cd ${{ secrets.APP_DIR }} && git rev-parse --short HEAD
+            ")
+            echo "📌 Current version on VPS: $FINAL_HASH"
+            
+            exit 1  # Mark job as failed
+          else
+            echo "✅ Deployment successful!"
+            NEW_HASH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+              cd ${{ secrets.APP_DIR }} && git rev-parse --short HEAD
+            ")
+            echo "📌 New version deployed: $NEW_HASH"
+            echo "🌎 Website: https://tekeyefrontend.clickmasters.pk"
+          fi
+
+      # Step 6: Send notification (Slack/Email can be added here)
+      - name: Send deployment notification
+        if: always()
+        run: |
+          if [[ "${{ steps.deploy.outcome }}" == "failure" ]]; then
+            echo "🔴 DEPLOYMENT FAILED - Rollback executed"
+            echo "🔙 Rolled back to: ${{ steps.get-current-version.outputs.current_hash }}"
+          else
+            echo "🟢 DEPLOYMENT SUCCESSFUL"
+            echo "🚀 New version deployed from main branch"
+          fi
           echo "⏰ Time: $(date)"
+          echo "🔍 View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  notify-on-failure:
+    name: Notify on Pipeline Failure
+    needs: [sync-branches, ci, cd]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "❌ CI/CD PIPELINE FAILED"
+          echo "📦 Repository: ${{ github.repository }}"
+          echo "🔍 Branch: ${{ github.ref_name }}"
+          echo "💻 Commit: ${{ github.sha }}"
+          echo "👤 Triggered by: ${{ github.triggering_actor }}"
+          echo "🔗 Link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          # You can add Slack/Discord/Email webhooks here
+          # curl -X POST -H 'Content-type: application/json' --data '{"text":"Deployment failed!"}' YOUR_SLACK_WEBHOOK_URL
