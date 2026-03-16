@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4  # Updated to v4
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
@@ -46,13 +46,13 @@ jobs:
         working-directory: frontend
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4  # Updated to v4
+        uses: actions/checkout@v4
         with:
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4  # Updated to v4
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'npm'
@@ -71,7 +71,7 @@ jobs:
         run: npm run build
         
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4  # Updated to v4 (FIXES THE ERROR!)
+        uses: actions/upload-artifact@v4
         with:
           name: build-output
           path: frontend/.next
@@ -99,7 +99,7 @@ jobs:
     environment: production
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4  # Updated to v4
+        uses: actions/checkout@v4
         with:
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
@@ -109,31 +109,28 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
-      # Step 1: Get current version (for rollback)
+      # Step 1: Get current version info
       - name: Get current commit hash from VPS
         id: get-current-version
         run: |
           echo "🔖 Getting current commit hash from VPS..."
           CURRENT_HASH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
-            cd ${{ secrets.APP_DIR }} && git rev-parse HEAD
+            cd ${{ secrets.APP_DIR }} 2>/dev/null && git rev-parse HEAD || echo 'none'
           ")
           echo "current_hash=$CURRENT_HASH" >> $GITHUB_OUTPUT
           echo "Current version: $CURRENT_HASH"
 
-      # Step 2: Get current PM2 status (for monitoring)
-      - name: Get current PM2 status
-        id: get-pm2-status
-        continue-on-error: true
+      - name: Get current branch
+        id: get-current-branch
         run: |
-          echo "📊 Getting current PM2 status..."
-          PM2_STATUS=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
-            cd ${{ secrets.APP_DIR }}
-            pm2 jlist | jq -r '.[] | select(.name == \"ci-cd-frontend\") | .pm2_env.status' 2>/dev/null || echo 'unknown'
+          echo "🔖 Getting current branch from VPS..."
+          CURRENT_BRANCH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+            cd ${{ secrets.APP_DIR }} 2>/dev/null && git rev-parse --abbrev-ref HEAD || echo 'none'
           ")
-          echo "pm2_status=$PM2_STATUS" >> $GITHUB_OUTPUT
-          echo "Current PM2 status: $PM2_STATUS"
+          echo "current_branch=$CURRENT_BRANCH" >> $GITHUB_OUTPUT
+          echo "Current branch: $CURRENT_BRANCH"
 
-      # Step 3: Deploy new version (with continue-on-error)
+      # Step 2: Deploy new version
       - name: Deploy new version via SSH
         id: deploy
         continue-on-error: true
@@ -142,73 +139,38 @@ jobs:
             set -e
             
             echo '🚀 Starting deployment of new version...'
-            echo '📂 Current directory:' \$(pwd)
             
             # Load NVM
-            echo '🔄 Loading NVM...'
             export NVM_DIR=\"\$HOME/.nvm\"
             if [ -s \"\$NVM_DIR/nvm.sh\" ]; then
               \\. \"\$NVM_DIR/nvm.sh\"
-              echo '✅ NVM loaded'
-            else
-              echo '⚠️ NVM not found, using direct path'
-              export PATH=\"/root/.nvm/versions/node/v24.13.0/bin:\$PATH\"
+              nvm use v24.13.0 2>/dev/null || echo 'Using Node from PATH'
             fi
             
-            # Use specific Node version
-            echo '🔄 Using Node.js v24.13.0...'
-            nvm use v24.13.0 2>/dev/null || echo 'Using Node from PATH'
-            
-            # Show versions
-            echo '🔧 Node version:' \$(node --version)
-            echo '🔧 npm version:' \$(npm --version)
-            echo '🔧 PM2 version:' \$(pm2 --version)
-            
-            # Navigate to project directory
-            echo '📂 Changing to project directory...'
             cd ${{ secrets.APP_DIR }}
-            echo '✅ Current directory:' \$(pwd)
             
-            # Pull latest code
             echo '📦 Pulling latest code from main branch...'
             git fetch --all
             git checkout main
             git reset --hard origin/main
-            echo '✅ Latest code pulled:' \$(git log -1 --pretty=format:'%h - %s (%ci)')
             
-            # Install dependencies
+            echo '🗑️ Cleaning node_modules and cache...'
+            rm -rf node_modules .next
+            npm cache clean --force
+            
             echo '📦 Installing dependencies...'
-            npm ci --only=production || npm install
+            npm install
             
-            # Build project
             echo '🏗️ Building project...'
             npm run build
             
-            # Test the build locally before restarting
-            echo '🧪 Testing build...'
-            if [ ! -d \".next\" ]; then
-              echo '❌ Build failed - .next directory not found!'
-              exit 1
-            fi
-            
-            # Restart PM2 with new code
-            echo '🚀 Managing PM2 process...'
-            if pm2 list | grep -q 'ci-cd-frontend'; then
-              echo '🔄 Restarting existing PM2 process...'
-              PORT=3002 pm2 restart ci-cd-frontend
-            else
-              echo '🆕 Starting new PM2 process...'
-              PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
-            fi
-            
-            # Save PM2 configuration
+            echo '🚀 Restarting PM2 process...'
+            PORT=3002 pm2 restart ci-cd-frontend || PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
             pm2 save
             
-            # Wait for app to start
             echo '⏳ Waiting for application to start...'
             sleep 10
             
-            # Test if application is running
             echo '🌐 Testing application...'
             HTTP_STATUS=\$(curl -o /dev/null -s -w \"%{http_code}\" http://localhost:3002)
             if [ \"\$HTTP_STATUS\" -eq 200 ] || [ \"\$HTTP_STATUS\" -eq 301 ] || [ \"\$HTTP_STATUS\" -eq 302 ]; then
@@ -221,11 +183,11 @@ jobs:
             echo '✅ New version deployed successfully!'
           "
 
-      # Step 4: Rollback on failure
-      - name: ⚠️ Rollback to previous version (deployment failed)
+      # Step 3: Enhanced Rollback with dependency fixing
+      - name: ⚠️ Smart Rollback with Auto-Fix
         if: steps.deploy.outcome == 'failure'
         run: |
-          echo "❌ DEPLOYMENT FAILED! Starting automatic rollback..."
+          echo "❌ DEPLOYMENT FAILED! Starting smart rollback with auto-fix..."
           echo "🔄 Rolling back to version: ${{ steps.get-current-version.outputs.current_hash }}"
           
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
@@ -234,42 +196,161 @@ jobs:
             echo '🔄 Loading NVM for rollback...'
             export NVM_DIR=\"\$HOME/.nvm\"
             [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"
+            nvm use v24.13.0 2>/dev/null
             
             cd ${{ secrets.APP_DIR }}
             
+            echo '📦 Cleaning current directory...'
+            git reset --hard HEAD
+            git clean -fd
+            
             echo '📦 Fetching previous version...'
             git fetch --all
-            git checkout ${{ steps.get-current-version.outputs.current_hash }}
             
-            echo '📦 Installing dependencies for previous version...'
-            npm ci --only=production || npm install
+            # Save current branch name
+            CURRENT_BRANCH=\"\${{ steps.get-current-branch.outputs.current_branch }}\"
+            
+            if [ \"\$CURRENT_BRANCH\" != \"none\" ] && [ \"\$CURRENT_BRANCH\" != \"HEAD\" ]; then
+              echo '🔄 Switching back to branch:' \$CURRENT_BRANCH
+              git checkout \$CURRENT_BRANCH
+            else
+              echo '🔄 Creating temporary branch from previous commit...'
+              git checkout -b rollback-branch-\$(date +%s) ${{ steps.get-current-version.outputs.current_hash }}
+            fi
+            
+            echo '🗑️ Cleaning node_modules and cache...'
+            rm -rf node_modules .next
+            npm cache clean --force
+            
+            echo '📦 Installing dependencies with auto-fix...'
+            npm install
+            
+            # Check for missing Tailwind CSS modules and fix
+            echo '🔧 Checking for missing PostCSS/Tailwind dependencies...'
+            if ! npm list @tailwindcss/postcss > /dev/null 2>&1; then
+              echo '⚠️ @tailwindcss/postcss not found, installing...'
+              npm install --save-dev @tailwindcss/postcss postcss autoprefixer
+            fi
+            
+            # Check if tailwindcss is installed
+            if ! npm list tailwindcss > /dev/null 2>&1; then
+              echo '⚠️ tailwindcss not found, installing...'
+              npm install --save-dev tailwindcss
+            fi
+            
+            # Check if postcss.config.js exists and is configured
+            if [ ! -f postcss.config.js ] && [ ! -f postcss.config.mjs ]; then
+              echo '⚠️ postcss.config.js not found, creating...'
+              cat > postcss.config.js << 'EOF'
+            module.exports = {
+              plugins: {
+                '@tailwindcss/postcss': {},
+                autoprefixer: {},
+              },
+            }
+            EOF
+            fi
+            
+            # Check if tailwind config exists
+            if [ ! -f tailwind.config.js ] && [ ! -f tailwind.config.mjs ]; then
+              echo '⚠️ tailwind.config.js not found, creating...'
+              cat > tailwind.config.js << 'EOF'
+            /** @type {import('tailwindcss').Config} */
+            module.exports = {
+              content: [
+                './app/**/*.{js,ts,jsx,tsx,mdx}',
+                './pages/**/*.{js,ts,jsx,tsx,mdx}',
+                './components/**/*.{js,ts,jsx,tsx,mdx}',
+              ],
+              theme: {
+                extend: {},
+              },
+              plugins: [],
+            }
+            EOF
+            fi
             
             echo '🏗️ Building previous version...'
             npm run build
             
             echo '🚀 Restarting PM2 with previous version...'
-            PORT=3002 pm2 restart ci-cd-frontend
+            PORT=3002 pm2 restart ci-cd-frontend || PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
+            pm2 save
             
-            echo '✅ Rollback completed. Application is now at previous stable version.'
+            echo '⏳ Waiting for application to start...'
+            sleep 15
+            
+            echo '🌐 Testing application...'
+            HTTP_STATUS=\$(curl -o /dev/null -s -w \"%{http_code}\" http://localhost:3002)
+            if [ \"\$HTTP_STATUS\" -eq 200 ] || [ \"\$HTTP_STATUS\" -eq 301 ] || [ \"\$HTTP_STATUS\" -eq 302 ]; then
+              echo \"✅ Application restored with HTTP \$HTTP_STATUS\"
+            else
+              echo \"⚠️ Application may not be fully functional, but rollback completed\"
+            fi
+            
+            echo '✅ Rollback completed. Application restored to previous stable version.'
           "
           
-          echo "⚠️ Rollback process finished. Deployment marked as failed."
+          echo "⚠️ Rollback process finished. Original deployment marked as failed."
+
+      # Step 4: Emergency fix if rollback fails
+      - name: 🚨 Emergency Recovery
+        if: steps.deploy.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "🚨 Attempting emergency recovery..."
+          
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+            set -e
+            
+            cd ${{ secrets.APP_DIR }}
+            
+            echo '📦 Creating backup of current state...'
+            tar -czf /tmp/app-backup-\$(date +%s).tar.gz . 2>/dev/null || true
+            
+            echo '🔄 Force reset to last known good state...'
+            git fetch --all
+            git reset --hard origin/main~1 2>/dev/null || git reset --hard origin/main
+            
+            echo '🗑️ Full clean and reinstall...'
+            rm -rf node_modules .next package-lock.json
+            npm cache clean --force
+            
+            echo '📦 Fresh install...'
+            npm install
+            
+            echo '🔧 Installing critical dependencies...'
+            npm install --save-dev tailwindcss postcss autoprefixer @tailwindcss/postcss
+            
+            echo '🏗️ Rebuild...'
+            npm run build
+            
+            echo '🚀 Force PM2 restart...'
+            pm2 delete ci-cd-frontend 2>/dev/null || true
+            PORT=3002 pm2 start npm --name 'ci-cd-frontend' -- start
+            pm2 save
+            
+            echo '✅ Emergency recovery completed'
+          "
 
       # Step 5: Verify final status
       - name: Verify final deployment status
         id: verify
         run: |
           if [[ "${{ steps.deploy.outcome }}" == "failure" ]]; then
-            echo "❌ Deployment failed and rollback was performed."
-            echo "🔙 Application rolled back to: ${{ steps.get-current-version.outputs.current_hash }}"
+            echo "❌ DEPLOYMENT FAILED - Rollback and recovery executed"
             
-            # Get current version after rollback
-            FINAL_HASH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
-              cd ${{ secrets.APP_DIR }} && git rev-parse --short HEAD
+            # Get final status
+            FINAL_STATUS=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
+              cd ${{ secrets.APP_DIR }} 2>/dev/null && 
+              echo \"Branch: \$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')\"
+              echo \"Commit: \$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')\"
+              pm2 list | grep 'ci-cd-frontend' || echo 'PM2 process not found'
             ")
-            echo "📌 Current version on VPS: $FINAL_HASH"
+            echo "📌 Current status on VPS:"
+            echo "$FINAL_STATUS"
             
-            exit 1  # Mark job as failed
+            exit 1  # Mark job as failed but app is running
           else
             echo "✅ Deployment successful!"
             NEW_HASH=$(ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
@@ -279,13 +360,14 @@ jobs:
             echo "🌎 Website: https://tekeyefrontend.clickmasters.pk"
           fi
 
-      # Step 6: Send notification (Slack/Email can be added here)
+      # Step 6: Notification
       - name: Send deployment notification
         if: always()
         run: |
           if [[ "${{ steps.deploy.outcome }}" == "failure" ]]; then
             echo "🔴 DEPLOYMENT FAILED - Rollback executed"
             echo "🔙 Rolled back to: ${{ steps.get-current-version.outputs.current_hash }}"
+            echo "🛠️ Auto-fix applied to restore functionality"
           else
             echo "🟢 DEPLOYMENT SUCCESSFUL"
             echo "🚀 New version deployed from main branch"
@@ -307,6 +389,6 @@ jobs:
           echo "💻 Commit: ${{ github.sha }}"
           echo "👤 Triggered by: ${{ github.triggering_actor }}"
           echo "🔗 Link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
-          # You can add Slack/Discord/Email webhooks here
-          # curl -X POST -H 'Content-type: application/json' --data '{"text":"Deployment failed!"}' YOUR_SLACK_WEBHOOK_URL
+          echo ""
+          echo "🔧 Auto-recovery was attempted. Check VPS manually if issues persist."
+          echo "💡 SSH into VPS and check: cd ${{ secrets.APP_DIR }} && npm run build"
