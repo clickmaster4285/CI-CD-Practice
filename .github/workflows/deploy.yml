@@ -54,19 +54,7 @@ jobs:
             git fetch --all
             git reset --hard origin/main
             
-            echo '📁 Checking for frontend folder...'
-            if [ -d "frontend" ]; then
-              cd frontend
-            else
-              echo '❌ frontend folder not found!'
-              exit 1
-            fi
-            
             echo '📦 Installing dependencies...'
-            export NVM_DIR=\"\$HOME/.nvm\"
-            [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"  # Load nvm
-            [ -s \"\$NVM_DIR/bash_completion\" ] && \\. \"\$NVM_DIR/bash_completion\"
-            
             npm install
             
             echo '🏗️ Building project...'
