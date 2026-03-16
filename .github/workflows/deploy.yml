@@ -45,6 +45,14 @@ jobs:
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
             set -e
             
+            # Load NVM
+            export NVM_DIR=\"\$HOME/.nvm\"
+            [ -s \"\$NVM_DIR/nvm.sh\" ] && \\. \"\$NVM_DIR/nvm.sh\"  # This loads nvm
+            [ -s \"\$NVM_DIR/bash_completion\" ] && \\. \"\$NVM_DIR/bash_completion\"
+            
+            # Use the specific Node version
+            nvm use v24.13.0
+            
             echo '🔍 Checking project directory...'
             cd ${{ secrets.APP_DIR }}
             pwd
