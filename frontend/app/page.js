@@ -1,185 +1,149 @@
-"use client"; // Add this at the top for client components
+'use client';
 
-import Image from "next/image";
-import { useEffect, useState } from "react";
+import { useState, useRef } from 'react';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Mail, Lock, Eye, EyeOff } from 'lucide-react';
 
-export default function Home() {
-  const [data, setData] = useState(null);
-  const [clickCount, setClickCount] = useState(0);
+export default function LoginPage() {
+  const [showPassword, setShowPassword] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [errors, setErrors] = useState({});
+  const formRef = useRef(null);
 
-  // ===== TRAP 1: Environment Variable Missing in Production =====
-  // This will be available in GitHub Actions but missing in production
-  const apiKey = process.env.NEXT_PUBLIC_SECRET_KEY;
-  
-  // ===== TRAP 2: Production-Only Crash on Mount =====
-  useEffect(() => {
-    console.log("Current environment:", process.env.NODE_ENV);
-    
-    // This check makes it pass in CI but fail in production
-    if (process.env.NODE_ENV === 'production') {
-      // This line will cause an error in production
-      // It tries to access a property of undefined
-      const crashHere = undefined.property.access;
-      
-      // If the above doesn't crash, this infinite loop will
-      while(true) {
-        console.log("🔥 PRODUCTION IS BURNING 🔥");
-        // No break condition = infinite loop
-      }
+  const validateForm = () => {
+    const formData = new FormData(formRef.current);
+    const email = formData.get('email')?.toString().trim();
+    const password = formData.get('password')?.toString().trim();
+    const errors = {};
+
+    if (!email || !email.includes('@')) {
+      errors.email = 'Please enter a valid email';
     }
-  }, []);
-
-  // ===== TRAP 3: API Call That Works in CI but Fails in Production =====
-  const fetchData = async () => {
-    try {
-      // This URL exists in CI/CD pipeline but not in production
-      const response = await fetch('http://localhost:3000/api/mock-endpoint');
-      const result = await response.json();
-      setData(result);
-    } catch (error) {
-      console.log("API call failed:", error);
-      
-      // This will throw in production but pass in CI
-      if (process.env.NODE_ENV === 'production') {
-        throw new Error("🚨 PRODUCTION API FAILURE 🚨");
-      }
+    if (!password || password.length < 6) {
+      errors.password = 'Password must be at least 6 characters';
     }
+
+    setErrors(errors);
+    return Object.keys(errors).length === 0;
   };
 
-  // ===== TRAP 4: Memory Leak Only in Production =====
-  const startMemoryLeak = () => {
-    if (process.env.NODE_ENV === 'production') {
-      const leakArray = [];
-      setInterval(() => {
-        // Continuously adding to array without clearing
-        leakArray.push(new Array(1000000).fill("💣 MEMORY LEAK 💣"));
-        console.log("Memory usage increasing:", leakArray.length);
-      }, 1000);
-    }
-  };
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!validateForm()) return;
 
-  // ===== TRAP 5: Recursive Function with No Base Case =====
-  const recursiveCrash = () => {
-    if (process.env.NODE_ENV === 'production') {
-      // No base case = infinite recursion
-      console.log("💥 CRASHING...");
-      return recursiveCrash();
-    }
-  };
-
-  // ===== TRAP 6: Access Browser API in Production =====
-  useEffect(() => {
-    if (process.env.NODE_ENV === 'production') {
-      // This will fail if window is undefined (server-side)
-      window.localStorage.setItem('crash', 'now');
-      
-      // Access non-existent browser feature
-      navigator.usb.getDevices(); // May not be available
-      
-      // Start memory leak
-      startMemoryLeak();
-    }
-  }, []);
-
-  // ===== TRAP 7: Production-Only Click Handler =====
-  const handleDangerousClick = () => {
-    setClickCount(clickCount + 1);
-    
-    if (process.env.NODE_ENV === 'production') {
-      if (clickCount > 3) {
-        // This will cause a runtime error
-        JSON.parse("{invalid json}");
-      }
-    }
+    setIsLoading(true);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    console.log('Login:', { email: formRef.current.email.value });
+    alert('Logged in successfully! (Demo)');
+    formRef.current.reset();
+    setErrors({});
+    setIsLoading(false);
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white">
-        <Image
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        
-        <div className="flex flex-col items-center gap-6 text-center">
-          <h1 className="max-w-xs text-3xl font-semibold">
-            {/* Different text in different environments */}
-            {process.env.NODE_ENV === 'production' 
-              ? '🔥 WILL CRASH IN PRODUCTION 🔥' 
-              : '✅ PASSING IN TESTS ✅'}
-          </h1>
-          
-          <p className="text-gray-600">
-            API Key status: {apiKey ? '✅ Present' : '❌ Missing'}
-          </p>
-          
-          <p className="text-gray-600">
-            Environment: {process.env.NODE_ENV}
-          </p>
-          
-          {/* Buttons that cause crashes in production */}
-          <div className="flex gap-4">
-            <button
-              onClick={fetchData}
-              className="px-4 py-2 bg-blue-500 text-white rounded"
-            >
-              Call API {process.env.NODE_ENV === 'production' && '💣'}
-            </button>
-            
-            <button
-              onClick={recursiveCrash}
-              className="px-4 py-2 bg-red-500 text-white rounded"
-            >
-              Crash Recursive {process.env.NODE_ENV === 'production' && '💣'}
-            </button>
-            
-            <button
-              onClick={handleDangerousClick}
-              className="px-4 py-2 bg-yellow-500 text-white rounded"
-            >
-              Click {clickCount} times {process.env.NODE_ENV === 'production' && '💣'}
-            </button>
-          </div>
-          
-          {/* Display fetched data */}
-          {data && (
-            <pre className="bg-gray-100 p-4 rounded">
-              {JSON.stringify(data, null, 2)}
-            </pre>
-          )}
-        </div>
-        
-        <div className="flex gap-4">
-          <a
-            className="px-4 py-2 bg-black text-white rounded"
-            href="https://vercel.com/new"
-            target="_blank"
-          >
-            Deploy Now
-          </a>
-        </div>
+    <main className="min-h-screen bg-background text-foreground flex items-center justify-center p-4 font-sans">
+      {/* Subtle background pattern using Shadcn colors */}
+      <div className="absolute inset-0 bg-gradient-to-br from-background/50 via-background to-muted/20" />
 
-        {/* ===== TRAP 8: Hidden Script Tag in Production ===== */}
-        {process.env.NODE_ENV === 'production' && (
-          <div dangerouslySetInnerHTML={{
-            __html: `
-              <script>
-                // This runs only in production
-                console.log("💀 HIDDEN PRODUCTION SCRIPT 💀");
-                
-                // Infinite loop in background
-                setInterval(() => {
-                  // Crash the page
-                  document.body.innerHTML = '';
-                }, 5000);
-              </script>
-            `
-          }} />
-        )}
-      </main>
-    </div>
+      <Card className="w-full max-w-md relative z-10 shadow-lg border-card/50 bg-card/95 backdrop-blur-sm">
+        <CardHeader className="text-center space-y-2">
+          {/* Icon using primary colors */}
+          <div className="mx-auto w-20 h-20 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center mb-4">
+            <Mail className="w-10 h-10 text-primary" />
+          </div>
+
+          <CardTitle className="text-3xl font-bold text-foreground">
+            Welcome Back
+          </CardTitle>
+          <CardDescription>
+            Sign in to your account to continue
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent className="space-y-6">
+          <form ref={formRef} onSubmit={handleSubmit} className="space-y-4">
+            {/* Email Field */}
+            <div className="grid gap-2">
+              <Label htmlFor="email" className="text-sm font-medium">
+                Email
+              </Label>
+              <div className="relative">
+                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Input
+                  id="email"
+                  name="email"
+                  type="email"
+                  placeholder="Enter your email"
+                  className="pl-10 h-12 rounded-xl"
+                  hasError={!!errors.email}
+                />
+              </div>
+              {errors.email && (
+                <p className="text-sm text-destructive">{errors.email}</p>
+              )}
+            </div>
+
+            {/* Password Field */}
+            <div className="grid gap-2">
+              <Label htmlFor="password" className="text-sm font-medium">
+                Password
+              </Label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  placeholder="Enter your password"
+                  className="pl-10 pr-10 h-12 rounded-xl"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 h-8 w-8 p-0 hover:bg-accent"
+                  onClick={() => setShowPassword(!showPassword)}
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </Button>
+              </div>
+              {errors.password && (
+                <p className="text-sm text-destructive">{errors.password}</p>
+              )}
+            </div>
+
+            {/* Remember Me */}
+            <div className="flex items-center space-x-2">
+              <Checkbox id="remember" name="remember" />
+              <Label htmlFor="remember" className="text-sm leading-none cursor-pointer">
+                Remember me
+              </Label>
+            </div>
+
+            {/* Submit Button */}
+            <Button
+              type="submit"
+              disabled={isLoading}
+              className="w-full h-12 rounded-xl"
+            >
+              {isLoading ? 'Signing In...' : 'Sign In'}
+            </Button>
+          </form>
+
+          {/* Footer Links */}
+          <div className="text-center text-sm text-muted-foreground space-y-2 pt-2">
+            <a href="#" className="hover:text-foreground font-medium hover:underline">Forgot password?</a>
+            <p>
+              Don't have an account?{' '}
+              <a href="#" className="text-primary hover:underline font-medium">Sign up</a>
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    </main>
   );
 }
